@@ -199,19 +199,6 @@ impl Stream {
         }
     }
 
-    /// Whether an established WebRTC transport reaches the peer over IPv6 (used to name the
-    /// transport in the UI). `None` for non-WebRTC transports and before ICE selects a pair —
-    /// every other transport already carries the family in the label it was raced under.
-    #[inline]
-    pub async fn webrtc_remote_ipv6(&self) -> Option<bool> {
-        match self {
-            #[cfg(feature = "webrtc")]
-            Stream::WebRTC(s) => s.is_remote_ipv6().await,
-            #[allow(unreachable_patterns)]
-            _ => None,
-        }
-    }
-
     /// DTLS certificate fingerprint for a WebRTC stream (`local`=true for this endpoint's own
     /// cert, false for the peer's), used to bind the channel to the signed peer identity.
     /// Returns None for non-WebRTC transports, which authenticate via the secretbox key exchange.
@@ -297,26 +284,5 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         self.close_webrtc();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_set_negotiated_key_refuses_unknown_versions() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut stream = Stream::from(TcpStream::connect(addr).await.unwrap(), addr);
-        let t = |picked| tcp::KxTranscript {
-            initiator_pk: &[1u8; 32],
-            responder_pk: &[2u8; 32],
-            advertised: 1,
-            picked,
-        };
-        let mut set = |picked| stream.set_negotiated_key(Key([0u8; 32]), true, &t(picked));
-        assert!(set(2).is_err());
-        assert!(set(1).is_ok());
     }
 }

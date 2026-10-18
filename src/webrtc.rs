@@ -41,7 +41,6 @@ use webrtc::peer_connection::RTCPeerConnection;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use percent_encoding::percent_decode_str;
 use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::time::{timeout, timeout_at, Instant};
 use url::Url;
@@ -59,11 +58,6 @@ enum WebRTCConnectionState {
     Closed(String),
 }
 
-/// A shared handle, not an owner: every clone points at the same `pc`, and `SESSIONS` holds one
-/// of those clones. Hence no `Drop` — closing per clone would kill a live session as soon as a
-/// losing race future is dropped, and closing on the last clone would wait on the very close
-/// that evicts the cache entry. Ownership is `OffererGuard` until a connection attempt adopts
-/// the stream and `Stream::WebRTC` after; holding one outside those two means closing it by hand.
 pub struct WebRTCStream {
     pc: Arc<RTCPeerConnection>,
     stream: Arc<Mutex<Arc<RTCDataChannel>>>,
@@ -90,19 +84,6 @@ pub struct WebRTCStream {
     // Whether anyone still wants this pc — see `HandoffState`. Shared by every clone, the
     // `SESSIONS` entry included, because that question is about the pc, not about one handle.
     handoff: Arc<HandoffState>,
-    // Taken once at construction: `pc.local_description()` grows with every gathered candidate
-    // and this must not (why: `UDP_ENDPOINT_BUDGET`). Shared so cloning the struct stays cheap.
-    local_endpoint: Arc<String>,
-    // Counts arriving fragments, which `recv_state` cannot answer for: that lock is deliberately
-    // held across the whole reassembly (see the field), so a sampler would block on it.
-    rx_probe: RxProbe,
-    // ICE has stopped hearing from the peer but the connection is not terminal yet. Kept out of
-    // `state_notify` on purpose - see where it is set.
-    disconnected: Arc<AtomicBool>,
-    // The largest message this stream will reassemble, lowered while the peer is unauthenticated.
-    // Shared by every clone, the `SESSIONS` entry included, because the receive path runs off a
-    // clone and the bound is about the pc, not about one handle.
-    max_recv_message: Arc<AtomicUsize>,
 }
 
 /// Whether a pc `new_inner` built is still wanted, shared by every `NewStreamHandoff` handed out
@@ -157,11 +138,11 @@ const FRAG_END: u8 = 0;
 /// unauthenticated peer can make a receiver hold. Kept at parity with TCP on purpose: one session
 /// moves between both paths, so a transport-specific ceiling would kill it on the other one.
 const MAX_RECV_MESSAGE: usize = crate::bytes_codec::MAX_FRAME_LENGTH;
-// Four networks, not four names: webrtc-ice queries each URL from its own socket, so entries
-// sharing a host buy no redundancy - the two this list used to carry failed together, in the same
-// millisecond, on a peer whose route to that one host was down. Two anycast, two unicast; the 443
-// entry is for networks that pass no other UDP port.
-static DEFAULT_ICE_SERVERS: [&str; 4] = [
+// use 3 public STUN servers to find out the NAT type, 2 must be the same address but different ports
+// https://stackoverflow.com/questions/72805316/determine-nat-mapping-behaviour-using-two-stun-servers
+// luckily nextcloud supports two ports for STUN
+// unluckily webrtc-rs does not use the same port to do the STUN request
+static DEFAULT_ICE_SERVERS: [&str; 3] = [
     "stun:stun.cloudflare.com:3478",
     "stun:stun.l.google.com:19302",
     "stun:stun.antisip.com:3478",
@@ -250,10 +231,6 @@ impl Clone for WebRTCStream {
             recv_state: self.recv_state.clone(),
             peer_verified: self.peer_verified.clone(),
             handoff: self.handoff.clone(),
-            local_endpoint: self.local_endpoint.clone(),
-            rx_probe: self.rx_probe.clone(),
-            disconnected: self.disconnected.clone(),
-            max_recv_message: self.max_recv_message.clone(),
         }
     }
 }
@@ -289,7 +266,7 @@ impl WebRTCStream {
     }
 
     // Envelope JSON key carrying the local description's ICE transport policy, alongside the
-    // RTCSessionDescription fields (see `local_endpoint`).
+    // RTCSessionDescription fields (see `get_local_endpoint_trickle`).
     // `'static` spelled out: an elided lifetime here is a warn-by-default future hard error on
     // the 1.75 toolchain CI pins (elided_lifetimes_in_associated_constant).
     const ICE_POLICY_KEY: &'static str = "ice_policy";
@@ -352,10 +329,6 @@ impl WebRTCStream {
     fn is_reusable_for(&self, force_relay: bool) -> bool {
         self.relay_only == force_relay
             && !self.handoff.closing.load(Ordering::Acquire)
-            // ICE has stopped hearing from the peer on this one. Not terminal, so nothing else
-            // rejects it, but handing it to a caller that is about to judge liveness starts them
-            // off already suspecting a pc they never used.
-            && !self.is_disconnected()
             && !matches!(
                 *self.state_notify.borrow(),
                 WebRTCConnectionState::Closed(_)
@@ -414,14 +387,8 @@ impl WebRTCStream {
         if host.is_empty() {
             return None;
         }
-        // `Url` hands userinfo back percent-encoded; the TURN server expects the value,
-        // so `p%40ss` must reach it as `p@ss` for the long-term credential to verify.
-        let username = percent_decode_str(u.username())
-            .decode_utf8_lossy()
-            .into_owned();
-        let credential = percent_decode_str(u.password().unwrap_or_default())
-            .decode_utf8_lossy()
-            .into_owned();
+        let username = u.username().to_string();
+        let credential = u.password().unwrap_or_default().to_string();
         // A TURN server without credentials is not merely useless: webrtc-rs validates every
         // configured server in `new_peer_connection`, so one credential-less entry makes EVERY
         // peer connection fail — including plain non-relay ones that never wanted TURN. The
@@ -499,24 +466,10 @@ impl WebRTCStream {
     }
 
     #[inline]
-    fn get_cc_enabled() -> bool {
-        let k = config::keys::OPTION_ALLOW_WEBRTC_CC;
-        config::option2bool(k, &config::Config::get_option(k))
-    }
-
-    #[inline]
     fn get_ice_servers() -> Vec<RTCIceServer> {
         Self::parse_ice_servers(&config::Config::get_option(
             config::keys::OPTION_ICE_SERVERS,
         ))
-    }
-
-    /// The default UDP STUN servers as bare `host:port`, for application-level address probes.
-    pub fn default_stun_servers() -> Vec<String> {
-        DEFAULT_ICE_SERVERS
-            .iter()
-            .filter_map(|url| url.strip_prefix("stun:").map(str::to_owned))
-            .collect()
     }
 
     /// Split out from `get_ice_servers` so parsing can be exercised without touching the
@@ -553,17 +506,6 @@ impl WebRTCStream {
         }
         ice_servers
     }
-
-    /// How many binding requests the answerer's ICE agent sends on a pair without a response
-    /// before giving up on it: 74 at the 200ms check interval is ~14.8s, just inside the 15s
-    /// persistence libwebrtc gives a pair (`CONNECTION_WRITE_TIMEOUT`), so both ends of a
-    /// browser session keep checking for about the same time. The ICE crate's default of 7
-    /// (~1.4s) is a server-side choice that assumes the other side keeps knocking; behind an
-    /// address-restricted NAT those requests are also what keep this side's mapping open to
-    /// the remote's checks, so stopping early closes the door on a pair that would have
-    /// connected once the path cleared, however long the remote keeps trying. Bounded by
-    /// `CONNECT_TIMEOUT` (18s).
-    const ICE_MAX_BINDING_REQUESTS: u16 = 74;
 
     /// Built and driven on `WEBRTC_RT`: every socket and background task the pc creates must
     /// belong to a runtime that outlives the session (see `WEBRTC_RT`). A caller that abandons
@@ -672,20 +614,14 @@ impl WebRTCStream {
         let pc = Arc::new(api.new_peer_connection(config).await?);
         // `on_*` handlers are never cleared — not by `close()`, not by `SESSIONS` eviction — so
         // this sender outlives the pc and would park a caller's ICE forwarder on `recv()` forever,
-        // holding the pc with it. Gathering complete (`None`) is the agent's last word short of an
-        // ICE restart, which nothing here does, so the sender goes with it and the forwarder ends
-        // there rather than with the session; the terminal-state handler below drops this closure
-        // for a pc that dies before it gets that far.
-        let mut local_ice_tx = Some(ice_tx);
+        // holding the pc with it. The terminal-state handler below drops this closure to break it.
+        let local_ice_tx = ice_tx.clone();
         pc.on_ice_candidate(Box::new(move |candidate| {
-            let Some(candidate) = candidate else {
-                local_ice_tx = None;
-                return Box::pin(async {});
-            };
-            let Some(local_ice_tx) = local_ice_tx.clone() else {
-                return Box::pin(async {});
-            };
+            let local_ice_tx = local_ice_tx.clone();
             Box::pin(async move {
+                let Some(candidate) = candidate else {
+                    return;
+                };
                 match candidate.to_json() {
                     Ok(candidate) => match serde_json::to_string(&candidate) {
                         Ok(candidate_json) => {
@@ -782,12 +718,6 @@ impl WebRTCStream {
         // pc and the ICE-candidate sender's forwarding task. Upgrade inside the handler; if the pc
         // is already gone there is nothing left in SESSIONS to evict.
         let pc_for_close = Arc::downgrade(&pc);
-        // Deliberately NOT a `WebRTCConnectionState` variant: that enum gates send and receive
-        // readiness (`wait_for_connect_result`) and session-cache admissibility, so a fourth state
-        // would have to be given a meaning at each of those. `Disconnected` is transient and must
-        // change neither, so it is reported beside them instead of through them.
-        let disconnected = Arc::new(AtomicBool::new(false));
-        let disconnected_for_state = disconnected.clone();
         pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             let stream_for_close2 = stream_for_close.clone();
             let on_connection_notify = notify_tx.clone();
@@ -805,8 +735,7 @@ impl WebRTCStream {
                         let _ =
                             on_connection_notify.send(WebRTCConnectionState::Closed(s.to_string()));
                         log::debug!("WebRTC session closing due to {}", s);
-                        let stream = stream_for_close2.lock().await.clone();
-                        let _ = stream.close().await;
+                        let _ = stream_for_close2.lock().await.close().await;
                         log::debug!("WebRTC session stream closed");
 
                         let Some(pc_for_close2) = pc_for_close2.upgrade() else {
@@ -818,14 +747,42 @@ impl WebRTCStream {
                         // ends instead of parking on `recv()` and holding this pc alive.
                         pc_for_close2.on_ice_candidate(Box::new(|_| Box::pin(async {})));
 
-                        // By pc identity, not by re-deriving the key: a duplicate offer shares
-                        // the key with the live winner, and this must not evict that one.
                         let mut sessions_lock = SESSIONS.lock().await;
-                        for key in Self::remove_sessions_for_peer(
-                            &mut sessions_lock,
-                            &pc_for_close2,
-                        ) {
-                            log::debug!("WebRTC session removed key: {}", key);
+                        match Self::get_key_for_peer(&pc_for_close2, start_local_offer).await {
+                            Ok(fingerprint) => {
+                                let k = Self::cache_key(&fingerprint, start_local_offer);
+                                // Only evict if the cached entry IS this pc: a duplicate offer
+                                // resolves to the same key, and closing the discarded duplicate pc
+                                // must not remove the live winner sharing that key.
+                                if sessions_lock
+                                    .get(&k)
+                                    .is_some_and(|s| Arc::ptr_eq(&s.pc, &pc_for_close2))
+                                {
+                                    sessions_lock.remove(&k);
+                                    log::debug!("WebRTC session removed key: {}", k);
+                                }
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "Failed to extract key for peer during session cleanup: {:?}",
+                                    e
+                                );
+                                // Fallback: try to remove any session associated with this peer connection
+                                let keys_to_remove: Vec<String> = sessions_lock
+                                    .iter()
+                                    .filter_map(|(key, session)| {
+                                        if Arc::ptr_eq(&session.pc, &pc_for_close2) {
+                                            Some(key.clone())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+                                for k in keys_to_remove {
+                                    sessions_lock.remove(&k);
+                                    log::debug!("WebRTC session removed by fallback key: {}", k);
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -836,58 +793,34 @@ impl WebRTCStream {
         // Trickle ICE: local-only work, no gathering wait — the controlled side awaits answer
         // creation inline on its punch-reply critical path. A failure below leaves a live pc whose
         // state handler only fires on a terminal ICE state, so close before propagating.
-        // Encode each endpoint before `set_local_description`, which is what starts gathering, so
-        // there is nothing for `trickle_endpoint` to strip in the first place.
-        let offer_answer: ResultType<(String, String)> = async {
+        let offer_answer: ResultType<String> = async {
             if start_local_offer {
                 let sdp = pc.create_offer(None).await?;
-                let endpoint = Self::trickle_endpoint(&sdp, force_relay)?;
                 pc.set_local_description(sdp.clone()).await?;
                 // SDP carries host/srflx IPs and ICE ufrag/pwd; log only its size, not the body.
-                log::debug!(
-                    "local offer SDP built ({} bytes, endpoint {} bytes)",
-                    sdp.sdp.len(),
-                    endpoint.len()
-                );
+                log::debug!("local offer SDP built ({} bytes)", sdp.sdp.len());
                 let k = Self::get_key_for_sdp(&sdp)?;
                 log::debug!("Start webrtc with local key: {}", k);
-                Ok((k, endpoint))
+                Ok(k)
             } else {
                 let sdp = serde_json::from_str::<RTCSessionDescription>(&remote_offer)?;
                 pc.set_remote_description(sdp.clone()).await?;
                 let answer = pc.create_answer(None).await?;
-                let endpoint = Self::trickle_endpoint(&answer, force_relay)?;
                 pc.set_local_description(answer).await?;
-                log::debug!(
-                    "remote offer SDP received ({} bytes), local answer endpoint {} bytes",
-                    sdp.sdp.len(),
-                    endpoint.len()
-                );
+                log::debug!("remote offer SDP received ({} bytes)", sdp.sdp.len());
                 let k = Self::get_key_for_sdp(&sdp)?;
                 log::debug!("Start webrtc with remote key: {}", k);
-                Ok((k, endpoint))
+                Ok(k)
             }
         }
         .await;
-        let (new_key, local_endpoint) = match offer_answer {
-            Ok(x) => x,
+        key = match offer_answer {
+            Ok(k) => k,
             Err(e) => {
                 pc.close().await.ok();
                 return Err(e);
             }
         };
-        // Only the UDP leg has a ceiling, and which leg carries this is the rendezvous server's
-        // to decide, so this reports rather than refuses: over a TCP/WS route a larger endpoint is
-        // delivered fine, and failing here would cost WebRTC for no reason.
-        if local_endpoint.len() > Self::UDP_ENDPOINT_BUDGET {
-            log::warn!(
-                "WebRTC endpoint is {} bytes, over the {} byte UDP budget; a peer reached over UDP \
-                 may never receive it",
-                local_endpoint.len(),
-                Self::UDP_ENDPOINT_BUDGET
-            );
-        }
-        key = new_key;
 
         let webrtc_stream = Self {
             pc,
@@ -902,10 +835,6 @@ impl WebRTCStream {
             recv_state: Arc::new(Mutex::new(RecvState::default())),
             peer_verified: Arc::new(AtomicBool::new(false)),
             handoff: Default::default(),
-            local_endpoint: Arc::new(local_endpoint),
-            rx_probe: RxProbe::new(),
-            disconnected,
-            max_recv_message: Arc::new(AtomicUsize::new(MAX_RECV_MESSAGE)),
         };
         // Insert into the session cache, but never `await pc.close()` while holding this lock:
         // `close()` fires the peer-connection-state handler inline, which itself locks SESSIONS,
@@ -951,76 +880,29 @@ impl WebRTCStream {
         // gathered host/srflx/relay candidates.
         let mut gather_complete = self.pc.gathering_complete_promise().await;
         let _gathering_channel_closed = gather_complete.recv().await;
-        let Some(local_desc) = self.pc.local_description().await else {
-            return Err(anyhow::anyhow!("Local desc is not set"));
-        };
-        Self::encode_endpoint(local_desc.sdp_type, &local_desc.sdp, self.relay_only)
+        self.get_local_endpoint_trickle().await
     }
 
-    /// The offer/answer exactly as it was created, for callers that signal candidates via
-    /// `take_local_ice_rx`. Taken at construction, so this cannot fail and cannot block — unlike
-    /// `get_local_endpoint`, which reads the live description and waits for gathering.
-    ///
-    /// Deliberately not `pc.local_description()`, which runs `populate_local_candidates` and so
-    /// returns the SDP plus every candidate gathered up to that moment — and callers read this a
-    /// network round trip after `new`, by which time gathering has filled it in. Why the size
-    /// matters: `UDP_ENDPOINT_BUDGET`.
+    /// Return the current local description immediately for callers that signal candidates via
+    /// `take_local_ice_rx`. Unlike `get_local_endpoint`, this does not wait for ICE gathering.
     #[inline]
-    pub fn local_endpoint(&self) -> &str {
-        self.local_endpoint.as_str()
-    }
-
-    /// The size a trickle endpoint must stay under for the UDP leg of its route to be safe. It is
-    /// the one signaling message that can grow: a peer registered over UDP receives it inside
-    /// `PunchHole` — with the mangled addresses and the permission blobs — as a single datagram,
-    /// and one that needs IP fragmentation is dropped without a trace on paths that discard
-    /// fragments. The candidates that follow are one small message each and never approach it.
-    ///
-    /// Not an MTU calculation: `PunchHole`'s other fields are not bounded here, so a value near
-    /// this number could still fragment. It is a tripwire on a quantity `trickle_endpoint` pins at
-    /// ~700 bytes, sized to leave that headroom while still catching a regression that lets
-    /// candidates back in — as a log line rather than another silent drop. Nothing enforces it: a
-    /// TCP/WS leg has no packet ceiling.
-    const UDP_ENDPOINT_BUDGET: usize = 1024;
-
-    /// The endpoint a trickling peer signals: the session parameters needed to start ICE and DTLS
-    /// (ice-ufrag, ice-pwd, fingerprint, setup, the sctp m-line), without the candidates — those
-    /// ride `take_local_ice_rx` and arrive as individual `IceCandidate` messages.
-    ///
-    /// Candidates are the only part of a local description that grows. Stripping them makes the
-    /// size a property of the value rather than of when it was taken, so it cannot drift with
-    /// gathering however this is later refactored.
-    fn trickle_endpoint(local_desc: &RTCSessionDescription, relay_only: bool) -> ResultType<String> {
-        let mut sdp = String::with_capacity(local_desc.sdp.len());
-        for line in local_desc.sdp.lines() {
-            // `end-of-candidates` would tell the remote agent to stop waiting for the trickle.
-            if line.starts_with("a=candidate:") || line.starts_with("a=end-of-candidates") {
-                continue;
-            }
-            sdp.push_str(line);
-            sdp.push_str("\r\n");
+    pub async fn get_local_endpoint_trickle(&self) -> ResultType<String> {
+        if let Some(local_desc) = self.pc.local_description().await {
+            let sdp = if self.relay_only {
+                serde_json::to_string(&local_desc)?
+            } else {
+                // Rides in the envelope, not a proto field the rendezvous server would forward,
+                // because it is the offer's own property: the receiver must know whether
+                // force_relay was policy (stay Relay-only) or transport. Older peers ignore it.
+                let mut v = serde_json::to_value(&local_desc)?;
+                v[Self::ICE_POLICY_KEY] = serde_json::Value::from(Self::ICE_POLICY_ALL);
+                serde_json::to_string(&v)?
+            };
+            let endpoint = Self::sdp_to_endpoint(&sdp);
+            Ok(endpoint)
+        } else {
+            Err(anyhow::anyhow!("Local desc is not set"))
         }
-        Self::encode_endpoint(local_desc.sdp_type, &sdp, relay_only)
-    }
-
-    /// Base64 envelope of a local description, carrying its ICE transport policy unless the pc is
-    /// Relay-only (see `ICE_POLICY_KEY`).
-    /// Built from the two fields a session description serializes rather than from the value, so
-    /// a caller that rewrote the SDP cannot leave a stale `parsed` tree riding along with it.
-    fn encode_endpoint(sdp_type: RTCSdpType, sdp: &str, relay_only: bool) -> ResultType<String> {
-        let mut envelope = serde_json::Map::new();
-        envelope.insert("type".to_owned(), serde_json::to_value(sdp_type)?);
-        envelope.insert("sdp".to_owned(), serde_json::Value::from(sdp));
-        if !relay_only {
-            // Rides in the envelope, not a proto field the rendezvous server would forward,
-            // because it is the offer's own property: the receiver must know whether
-            // force_relay was policy (stay Relay-only) or transport. Older peers ignore it.
-            envelope.insert(
-                Self::ICE_POLICY_KEY.to_owned(),
-                serde_json::Value::from(Self::ICE_POLICY_ALL),
-            );
-        }
-        Ok(Self::sdp_to_endpoint(&serde_json::to_string(&envelope)?))
     }
 
     /// Whether the peer's endpoint declares it was built with ICE transport policy `all`
@@ -1086,20 +968,6 @@ impl WebRTCStream {
                 .filter_map(|side| side.split_whitespace().nth(2))
                 .any(|typ| typ == relay),
         )
-    }
-
-    /// Whether the nominated pair reaches the peer over IPv6 — `None` before one is selected.
-    /// The remote side on purpose: it is the address the peer is actually reached at, which the
-    /// rendezvous-observed address the session is otherwise identified by cannot report.
-    pub async fn is_remote_ipv6(&self) -> Option<bool> {
-        let dtls = self.pc.sctp().transport();
-        let pair = dtls.ice_transport().get_selected_candidate_pair().await?;
-        // Same `Display` parse as `is_relayed`, one token over: a side renders as
-        // `(remote) <protocol> <typ> <address>:<port>`, and `protocol` is only udp/tcp, so the
-        // family has to come from the address — an IPv6 literal is the only one with two colons.
-        let pair = pair.to_string();
-        let remote = pair.split(" <-> ").nth(1)?;
-        Some(remote.split_whitespace().nth(3)?.matches(':').count() > 1)
     }
 
     #[inline]
@@ -1460,11 +1328,6 @@ impl WebRTCStream {
                     )));
                 }
             };
-            // Before the framing checks below: a fragment that turns out to be malformed still
-            // proves the peer sent it, which is all this counter claims.
-            if n > 0 {
-                self.rx_probe.add(n);
-            }
             if n == 0 {
                 // Not exclusively a stream reset: webrtc-data maps the empty-message PPIDs to
                 // n == 0 as well and `read` drops the flag that would separate them. Both mean
@@ -1497,7 +1360,7 @@ impl WebRTCStream {
             // Bound BEFORE growing: this framing carries no length, so an oversize message is only
             // discovered by accumulating it, and checking after the append would let `BytesMut`'s
             // reallocate-and-copy hold the old and the new buffer at once.
-            if acc.len() + (n - 1) > self.max_recv_message.load(Ordering::Relaxed) {
+            if acc.len() + (n - 1) > MAX_RECV_MESSAGE {
                 // Release the buffer, don't just truncate it: by definition it is near the cap
                 // here, and `recv_state` outlives this call through the `SESSIONS` clone.
                 *acc = BytesMut::new();
@@ -1515,10 +1378,7 @@ impl WebRTCStream {
             }
             acc.extend_from_slice(&scratch[1..n]);
             if header == FRAG_END {
-                // Split, not take: the caller has dropped the message by the time the next
-                // fragment lands, so `reserve` reclaims this allocation instead of regrowing it
-                // from nothing for every fragmented frame.
-                let msg = acc.split();
+                let msg = std::mem::take(acc);
                 return Some(Ok(msg));
             }
         }
@@ -1543,7 +1403,7 @@ mod tests {
     use crate::webrtc::WebRTCStream;
     use crate::webrtc::{NewStreamHandoff, DEFAULT_ICE_SERVERS, FRAG_MORE, SESSIONS, WEBRTC_RT};
     use bytes::{BufMut, Bytes, BytesMut};
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration};
     use tokio::sync::Barrier;
     use tokio::time::timeout;
     use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
@@ -1566,14 +1426,6 @@ mod tests {
                 .urls[0],
             "turn:example.com:3478"
         );
-
-        // Userinfo arrives percent-encoded from the URL parser; the TURN server wants the
-        // value, so a password written `p%40ss` authenticates as `p@ss`.
-        let encoded =
-            WebRTCStream::get_ice_server_from_url("turn://us%20er:p%40s%2Fs%25@example.com")
-                .expect("encoded credentials are usable");
-        assert_eq!(encoded.username, "us er");
-        assert_eq!(encoded.credential, "p@s/s%");
 
         // TURN without both halves of the credential is dropped rather than passed on:
         // webrtc-rs validates every configured server when the peer connection is built, so
@@ -1697,108 +1549,6 @@ mod tests {
             webrtc::peer_connection::sdp::session_description::RTCSessionDescription,
         >(&sdp_json)
         .expect("extra envelope key must not break RTCSessionDescription parsing");
-    }
-
-    /// The live description once it has gathered something. Polls instead of awaiting
-    /// `gathering_complete_promise`: a stream sits in the global `SESSIONS` for the whole wait, and
-    /// waiting out gathering there is long enough to trip `test_cancelled_new_does_not_leak_the_pc`
-    /// when the suite runs its tests in parallel. One candidate is all these tests need.
-    /// Returns `None` on timeout rather than panicking: the caller must get to `close()` before
-    /// it asserts, or a stranded pc fails `test_cancelled_new_does_not_leak_the_pc` as well and
-    /// one root failure is reported as two.
-    async fn first_gathered_description(stream: &WebRTCStream) -> Option<RTCSessionDescription> {
-        timeout(Duration::from_secs(10), async {
-            loop {
-                if let Some(desc) = stream.pc.local_description().await {
-                    if desc.sdp.contains("a=candidate:") {
-                        return desc;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .ok()
-    }
-
-    /// The signalled endpoint and the live description must diverge. `pc.local_description()`
-    /// appends every candidate gathered so far; the endpoint the peer is handed must not grow with
-    /// them, because the rendezvous server delivers it to a UDP-registered peer as one datagram
-    /// and a fragmented one is dropped without a trace on paths that discard fragments.
-    #[tokio::test]
-    async fn test_stored_endpoint_does_not_grow_with_the_live_description() {
-        let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
-        let live = first_gathered_description(&offerer).await;
-        let endpoint = offerer.local_endpoint().to_owned();
-        offerer.close().await;
-
-        // Some(_) is the assertion that the live description grew: the helper only returns once it
-        // carries a candidate, so the endpoint below really had something to grow by.
-        live.expect("no ICE candidate gathered within 10s");
-        assert!(
-            !WebRTCStream::get_remote_offer(&endpoint)
-                .unwrap()
-                .contains("a=candidate"),
-            "the signalled endpoint grew candidates alongside the live description"
-        );
-        assert!(
-            endpoint.len() <= WebRTCStream::UDP_ENDPOINT_BUDGET,
-            "signalled endpoint is {} bytes, over the {} byte budget",
-            endpoint.len(),
-            WebRTCStream::UDP_ENDPOINT_BUDGET
-        );
-    }
-
-    /// The split itself: candidates out, everything ICE and DTLS need to start in. A stripped
-    /// endpoint the peer cannot consume would trade a silent drop for a silent failure.
-    #[tokio::test]
-    async fn test_trickle_endpoint_splits_candidates_off() {
-        let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
-        let gathered = first_gathered_description(&offerer).await;
-        offerer.close().await;
-        let gathered = gathered.expect("no ICE candidate gathered within 10s");
-
-        let endpoint = WebRTCStream::trickle_endpoint(&gathered, false).unwrap();
-        let json = WebRTCStream::get_remote_offer(&endpoint).unwrap();
-        assert!(!json.contains("a=candidate:"), "candidate survived the split");
-        assert!(
-            !json.contains("a=end-of-candidates"),
-            "end-of-candidates would stop the remote agent waiting for the trickle"
-        );
-        for keep in [
-            "m=application",
-            "a=ice-ufrag:",
-            "a=ice-pwd:",
-            "a=fingerprint:",
-            "a=setup:",
-            "a=mid:",
-            "a=sctp-port:",
-        ] {
-            assert!(json.contains(keep), "trickle endpoint dropped {}", keep);
-        }
-        assert!(
-            endpoint.len() <= WebRTCStream::UDP_ENDPOINT_BUDGET,
-            "stripped endpoint is {} bytes",
-            endpoint.len()
-        );
-        // `parsed` is #[serde(skip)], so deserializing alone would accept any string as the SDP
-        // body. Unmarshal it, which is also what the peer does, and require the fingerprint the
-        // session key is derived from to have survived.
-        let desc: RTCSessionDescription =
-            serde_json::from_str(&json).expect("a stripped endpoint must deserialize");
-        WebRTCStream::get_key_for_sdp(&desc)
-            .expect("a stripped endpoint must still parse as SDP and keep its fingerprint");
-
-        // `encode_endpoint`, which `get_local_endpoint` also goes through, holds the opposite
-        // contract: carry whatever it is handed, candidates included. (What `get_local_endpoint`
-        // adds on top — the gathering wait — is covered by test_webrtc_loopback_gathered_endpoints.)
-        let kept = WebRTCStream::encode_endpoint(gathered.sdp_type, &gathered.sdp, false).unwrap();
-        assert!(
-            WebRTCStream::get_remote_offer(&kept)
-                .unwrap()
-                .contains("a=candidate:"),
-            "encode_endpoint dropped the candidates it was handed"
-        );
     }
 
     #[test]
@@ -1980,42 +1730,6 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     }
 
     #[tokio::test]
-    async fn test_session_cleanup_only_removes_matching_peer() {
-        let key = "test-session-cleanup".to_owned();
-        let old_key = "test-session-cleanup-old".to_owned();
-        let old = new_test_stream().await;
-        let replacement = new_test_stream().await;
-        let mut sessions = HashMap::new();
-        sessions.insert(key.clone(), replacement.clone());
-
-        assert!(WebRTCStream::remove_sessions_for_peer(&mut sessions, &old.pc).is_empty());
-        assert!(Arc::ptr_eq(
-            &sessions.get(&key).unwrap().pc,
-            &replacement.pc,
-        ));
-
-        sessions.insert(old_key.clone(), old.clone());
-        assert_eq!(
-            WebRTCStream::remove_sessions_for_peer(&mut sessions, &old.pc),
-            vec![old_key.clone()],
-        );
-        assert!(!sessions.contains_key(&old_key));
-        assert!(Arc::ptr_eq(
-            &sessions.get(&key).unwrap().pc,
-            &replacement.pc,
-        ));
-
-        assert_eq!(
-            WebRTCStream::remove_sessions_for_peer(&mut sessions, &replacement.pc),
-            vec![key.clone()],
-        );
-        assert!(!sessions.contains_key(&key));
-
-        old.pc.close().await.ok();
-        replacement.pc.close().await.ok();
-    }
-
-    #[tokio::test]
     async fn test_webrtc_wait_connected_timeout() {
         let mut stream = WebRTCStream::new("", false, 100).await.unwrap();
         let err = stream.wait_connected(10).await.unwrap_err();
@@ -2025,9 +1739,9 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
 
     async fn connect_loopback() -> (WebRTCStream, WebRTCStream) {
         let mut offerer = WebRTCStream::new("", false, 20000).await.unwrap();
-        let offer = offerer.local_endpoint().to_owned();
+        let offer = offerer.get_local_endpoint_trickle().await.unwrap();
         let answerer = WebRTCStream::new(&offer, false, 20000).await.unwrap();
-        let answer = answerer.local_endpoint().to_owned();
+        let answer = answerer.get_local_endpoint_trickle().await.unwrap();
         offerer.set_remote_endpoint(&answer).await.unwrap();
 
         // Bridge trickle candidates directly between the two peers, both directions.
@@ -2143,7 +1857,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     #[tokio::test]
     async fn test_cached_peer_is_not_reused_across_ice_policies() {
         let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
-        let offer = offerer.local_endpoint().to_owned();
+        let offer = offerer.get_local_endpoint_trickle().await.unwrap();
 
         let all_ice = WebRTCStream::new(&offer, false, 20000).await.unwrap();
         assert!(!all_ice.relay_only);
@@ -2162,9 +1876,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // The local-candidate channel must close when the pc does. Its only sender lives inside the
     // on_ice_candidate handler, which close() does not clear, so without the teardown the
     // receiver stays open forever — and the forwarder loop this API asks callers to write holds
-    // a stream clone while parked on recv(), keeping the pc alive past its own close. Gathering
-    // complete drops the sender as well, and may beat the close here; a pc closed before that
-    // has only the teardown, which is what this pins.
+    // a stream clone while parked on recv(), keeping the pc alive past its own close.
     #[tokio::test]
     async fn test_local_ice_channel_closes_with_the_peer_connection() {
         let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
@@ -2185,24 +1897,6 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             .await
             .expect("forwarder task outlived the peer connection")
             .unwrap();
-    }
-
-    // The channel must close when gathering does, with the pc still open: nothing can follow the
-    // agent's last candidate, and a forwarder parked on recv() until the session ends holds its
-    // signaling connection for that whole time — long after the server's idle close, as a socket
-    // left in CLOSE_WAIT.
-    #[tokio::test]
-    async fn test_local_ice_channel_closes_when_gathering_completes() {
-        let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
-        let mut ice_rx = offerer.take_local_ice_rx().unwrap();
-        let drained = timeout(Duration::from_secs(20), async {
-            while ice_rx.recv().await.is_some() {}
-        })
-        .await;
-        // Close before asserting, or a failure here strands the pc and fails
-        // `test_cancelled_new_does_not_leak_the_pc` as well.
-        offerer.close().await;
-        drained.expect("local ICE channel outlived gathering");
     }
 
     // Extra channels must not displace the bound one: the newcomer's on_open would push Open onto
@@ -2231,9 +1925,9 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             .await
             .unwrap();
 
-        let offer = offerer.local_endpoint().to_owned();
+        let offer = offerer.get_local_endpoint_trickle().await.unwrap();
         let answerer = WebRTCStream::new(&offer, false, 20000).await.unwrap();
-        let answer = answerer.local_endpoint().to_owned();
+        let answer = answerer.get_local_endpoint_trickle().await.unwrap();
         offerer.set_remote_endpoint(&answer).await.unwrap();
 
         let mut off_ice = offerer.take_local_ice_rx().unwrap();
@@ -2289,171 +1983,6 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         timeout(Duration::from_secs(40), connect)
             .await
             .expect("gathered-endpoint WebRTC loopback did not complete in time");
-    }
-
-    // The state mapping the health flag is built from. ICE raises `Disconnected` only on a real
-    // consent failure, which an in-process loopback cannot produce, so this drives the mapping
-    // directly; the loopback test below covers the wiring from the flag out to callers.
-    #[test]
-    fn test_note_health_maps_only_the_transient_states() {
-        use crate::webrtc::RTCPeerConnectionState;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let flag = AtomicBool::new(false);
-
-        WebRTCStream::note_health(&flag, RTCPeerConnectionState::Disconnected);
-        assert!(flag.load(Ordering::SeqCst), "Disconnected must raise the hint");
-
-        WebRTCStream::note_health(&flag, RTCPeerConnectionState::Connected);
-        assert!(!flag.load(Ordering::SeqCst), "Connected must clear it");
-
-        // The terminal states have their own path and must not touch the hint: a session that
-        // ends has no use for one, and clearing it here would hide a peer that went silent first.
-        for terminal in [
-            RTCPeerConnectionState::Failed,
-            RTCPeerConnectionState::Closed,
-        ] {
-            WebRTCStream::note_health(&flag, RTCPeerConnectionState::Disconnected);
-            WebRTCStream::note_health(&flag, terminal);
-            assert!(
-                flag.load(Ordering::SeqCst),
-                "{} must leave the hint as it found it",
-                terminal
-            );
-        }
-    }
-
-    // Pins the wiring and the polarity of the health flag: a pair that just connected must not
-    // look suspect.
-    #[tokio::test]
-    async fn test_webrtc_disconnected_is_false_on_a_live_pair() {
-        let body = async {
-            let (offerer, answerer) = connect_loopback().await;
-            assert!(!offerer.is_disconnected());
-            assert!(!answerer.is_disconnected());
-            offerer.close().await;
-            answerer.close().await;
-        };
-        timeout(Duration::from_secs(30), body)
-            .await
-            .expect("WebRTC loopback did not complete in time");
-    }
-
-    // A message far above the fragment size must show as activity while it is still arriving:
-    // `next()` yields nothing until the last fragment, so a receiver watching only completed
-    // messages cannot tell a peer mid-transfer from one that died.
-    #[tokio::test]
-    async fn test_webrtc_rx_progress_moves_before_a_large_message_completes() {
-        let body = async {
-            let (mut offerer, mut answerer) = connect_loopback().await;
-
-            offerer.send_raw(b"warmup".to_vec()).await.unwrap();
-            assert_eq!(&answerer.next().await.unwrap().unwrap()[..], b"warmup");
-            let baseline = answerer.rx_progress();
-
-            // Large enough that it cannot land inside one poll of the loop below, so a probe
-            // that only counted whole messages would leave the counter untouched throughout.
-            let big = vec![0x5Au8; 4 * 1024 * 1024];
-            let expected = big.len();
-            let sender = tokio::spawn(async move { offerer.send_raw(big).await.map(|_| offerer) });
-
-            // `next_timeout` returning None leaves the partial message in place, so the counter
-            // is read at a point where nothing has been delivered. No select and no sleeping
-            // sibling: the assertion cannot turn on which branch a poll happened to take.
-            let mut moved_early = false;
-            let mut got = None;
-            for _ in 0..600 {
-                match answerer.next_timeout(20).await {
-                    Some(msg) => {
-                        got = Some(msg);
-                        break;
-                    }
-                    None => {
-                        if answerer.rx_progress() > baseline {
-                            moved_early = true;
-                        }
-                    }
-                }
-            }
-
-            assert!(
-                moved_early,
-                "rx_progress must advance while the message is still incomplete"
-            );
-            assert_eq!(
-                got.expect("message never completed").unwrap().len(),
-                expected
-            );
-            let offerer = sender.await.unwrap().expect("send");
-            // `WebRTCStream` has no `Drop`, so both pcs stay in `SESSIONS` unless closed here;
-            // `test_cancelled_new_does_not_leak_the_pc` scans that map and would report them.
-            offerer.close().await;
-            answerer.close().await;
-        };
-        timeout(Duration::from_secs(60), body)
-            .await
-            .expect("WebRTC loopback did not complete in time");
-    }
-
-    // The bound `Stream::set_max_packet_length` lowers before authorization: a message above it
-    // must end the connection as it arrives, not be reassembled. Only the receiver's bound moves,
-    // so the sender still puts it on the wire, exactly as an unauthenticated peer would.
-    #[tokio::test]
-    async fn test_webrtc_max_packet_length_bounds_reassembly() {
-        let body = async {
-            let (mut offerer, mut answerer) = connect_loopback().await;
-            answerer.set_max_packet_length(16 * 1024);
-
-            offerer.send_raw(vec![0xCDu8; 8 * 1024]).await.unwrap();
-            let got = answerer.next().await.unwrap().unwrap();
-            assert_eq!(got.len(), 8 * 1024, "a message under the bound still arrives");
-
-            offerer.send_raw(vec![0xCDu8; 200_000]).await.unwrap();
-            match timeout(Duration::from_secs(10), answerer.next()).await {
-                Ok(Some(Err(e))) => assert!(
-                    e.to_string().contains("maximum frame size"),
-                    "unexpected error: {}",
-                    e
-                ),
-                Ok(Some(Ok(b))) => panic!("expected a refusal, got {} bytes", b.len()),
-                Ok(None) => panic!("expected a refusal, got EOF"),
-                Err(_) => panic!("answerer.next() hung on an oversize message"),
-            }
-
-            offerer.close().await;
-            answerer.close().await;
-        };
-        timeout(Duration::from_secs(60), body)
-            .await
-            .expect("WebRTC loopback did not complete in time");
-    }
-
-    // The other half of the same lifecycle: what was refused while the bound was low arrives once
-    // it is lifted, which is what authorization does on the server.
-    #[tokio::test]
-    async fn test_webrtc_max_packet_length_restores() {
-        let body = async {
-            let (mut offerer, mut answerer) = connect_loopback().await;
-            answerer.set_max_packet_length(16 * 1024);
-
-            offerer.send_raw(vec![0xCDu8; 8 * 1024]).await.unwrap();
-            let got = answerer.next().await.unwrap().unwrap();
-            assert_eq!(got.len(), 8 * 1024);
-
-            answerer.set_max_packet_length(usize::MAX);
-            offerer.send_raw(vec![0xCDu8; 200_000]).await.unwrap();
-            let got = timeout(Duration::from_secs(10), answerer.next())
-                .await
-                .expect("answerer.next() hung after the bound was lifted")
-                .unwrap()
-                .unwrap();
-            assert_eq!(got.len(), 200_000, "lifting the bound lets a large message through again");
-
-            offerer.close().await;
-            answerer.close().await;
-        };
-        timeout(Duration::from_secs(60), body)
-            .await
-            .expect("WebRTC loopback did not complete in time");
     }
 
     // In-process offerer<->answerer loopback exercising the send/next data plane that the framing,
@@ -2610,61 +2139,33 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     }
 
     // End-to-end: cancel `new()` itself after its first poll (the spawn is already in flight)
-    // and every session it transiently created must be closed and evicted again.
-    //
-    // The cancelled attempt's own key is unknowable here — its DTLS fingerprint is generated
-    // inside the task that was abandoned — so what is watched for is a key that OUTLASTS the
-    // window, not an instant with no new keys at all. Concurrent tests each close what they
-    // create, so their keys come and go and drop out of the running intersection; a leaked pc
-    // never does. Waiting for an empty difference instead made this test depend on the suite
-    // having an idle moment, which `--test-threads=2` never gives it: one lane is this test for
-    // the whole wait while the other keeps starting sessions.
+    // and every session it transiently created must be closed and evicted again. Keys are
+    // compared as a set difference so concurrent tests' own sessions do not interfere; theirs
+    // clean up within the wait too.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_cancelled_new_does_not_leak_the_pc() {
         use std::collections::HashSet;
         let before: HashSet<String> = SESSIONS.lock().await.keys().cloned().collect();
-        // Zero timeout: polls the future exactly once (spawning new_inner), then cancels it —
-        // usually. The setup task runs on its own runtime and can finish inside that single poll,
-        // and then `new()` hands back a live stream instead. `WebRTCStream` has no `Drop`, so
-        // discarding that one is itself a leak, and this test would go on to report it as the
-        // cancelled attempt's. Close what comes back and try for a real cancellation. Fewer test
-        // threads make the setup task likelier to win, which is why this surfaced under
-        // `--test-threads=2` and not at the default.
-        let mut cancelled = false;
-        for _ in 0..20 {
-            match timeout(Duration::ZERO, WebRTCStream::new("", false, 20000)).await {
-                Err(_) => {
-                    cancelled = true;
-                    break;
-                }
-                Ok(Ok(stream)) => stream.close().await,
-                Ok(Err(_)) => {}
-            }
-        }
-        assert!(cancelled, "new() never lost the race with its own cancellation");
-        // Let the detached setup task finish (and insert its session) before sampling, or the
-        // first sample is taken before the leak has formed and every later one intersects to
-        // nothing.
+        // Zero timeout: polls the future exactly once (spawning new_inner), then cancels it.
+        let _ = timeout(Duration::ZERO, WebRTCStream::new("", false, 20000)).await;
+        // Let the detached setup task finish (and insert its session) before demanding the
+        // difference be empty, or an early check passes vacuously while the leak forms later.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        const ATTEMPTS: usize = 600; // 30s
-        let mut persisted: Option<HashSet<String>> = None;
+        // 30s: concurrent tests' transient sessions land in the difference too and must be
+        // given time to finish and evict (every test closes what it creates).
+        const ATTEMPTS: usize = 600;
         for attempt in 1..=ATTEMPTS {
             let now: HashSet<String> = SESSIONS.lock().await.keys().cloned().collect();
-            let new_keys: HashSet<String> = now.difference(&before).cloned().collect();
-            persisted = Some(match persisted {
-                None => new_keys,
-                Some(prev) => prev.intersection(&new_keys).cloned().collect(),
-            });
-            let persisted_keys = persisted.as_ref().map_or(0, HashSet::len);
-            if persisted_keys == 0 {
+            let leftover: Vec<&String> = now.difference(&before).collect();
+            if leftover.is_empty() {
                 return;
             }
-            // Positional, not an inline `{persisted:?}`: on edition 2018 a lone-literal `panic!`
+            // Positional, not an inline `{leftover:?}`: on edition 2018 a lone-literal `panic!`
             // does not go through format_args and would print the placeholder verbatim.
             assert!(
                 attempt < ATTEMPTS,
-                "cancelled new() left a pc cached in SESSIONS (persisted: {:?})",
-                persisted
+                "cancelled new() left a pc cached in SESSIONS (leftover: {:?})",
+                leftover
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

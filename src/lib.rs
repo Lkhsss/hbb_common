@@ -56,7 +56,6 @@ pub use uuid;
 pub mod fingerprint;
 pub use flexi_logger;
 pub mod log_throttle;
-pub mod rx_probe;
 pub mod stream;
 pub mod websocket;
 #[cfg(feature = "webrtc")]
@@ -468,13 +467,13 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                         // much disk this uses. Bounding it here covers every call site at once.
                         Criterion::AgeOrSize(Age::Day, 16 * 1024 * 1024),
                         Naming::Timestamps,
-                        // 90 files is ~90 days for any machine that stays under the
+                        // Unchanged at 31, which is ~31 days for any machine that stays under the
                         // size criterion — i.e. every ordinary install, on every platform this
                         // ships to. Raising it to protect the flood case would have bought little
                         // (a count cannot outrun a flood; only the rate limits at the log sites
                         // can) at the price of multiplying steady-state retention and disk for
                         // everyone.
-                        Cleanup::KeepLogFiles(90),
+                        Cleanup::KeepLogFiles(31),
                     )
                     .start()
                     .ok();
