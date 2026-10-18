@@ -1,11 +1,9 @@
 pub mod compress;
-pub mod platform;
 pub mod protos;
 pub use bytes;
 use config::Config;
 pub use futures;
 pub use protobuf;
-pub use protos::message as message_proto;
 pub use protos::rendezvous as rendezvous_proto;
 use serde_derive::{Deserialize, Serialize};
 use std::{
@@ -27,7 +25,6 @@ pub mod bytes_codec;
 pub use anyhow::{self, bail};
 pub use futures_util;
 pub mod config;
-pub mod fs;
 pub mod mem;
 pub use lazy_static;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -42,7 +39,8 @@ pub mod password_security;
 pub use chrono;
 pub use directories_next;
 pub use libc;
-pub mod keyboard;
+#[cfg(target_os = "linux")]
+pub mod sh;
 pub use base64;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use dlopen;
@@ -430,10 +428,15 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
     #[allow(unused_mut)]
     let mut logger_holder: Option<flexi_logger::LoggerHandle> = None;
     INIT.call_once(|| {
+        // webrtc-rs reports the racing design's normal outcome at warn: cancelling the transport
+        // that lost closes every gathered candidate one line at a time, and trickle means the
+        // agent always checks before it holds a pair. Both read as faults beside a connection
+        // that succeeded. agent_gather keeps its warn level - a STUN server it could not reach
+        // is the one upstream signal that explains a session which never connected.
         #[cfg(debug_assertions)]
         {
             use env_logger::*;
-            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn"));
+            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,hyper_util=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn,webrtc_ice::agent::agent_internal=error,webrtc::peer_connection=error"));
         }
         #[cfg(not(debug_assertions))]
         {
@@ -448,7 +451,7 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                 path.push(_name);
             }
             use flexi_logger::*;
-            if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn") {
+            if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,hyper_util=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn,webrtc_ice::agent::agent_internal=error,webrtc::peer_connection=error") {
                 logger_holder = x
                     .log_to_file(FileSpec::default().directory(path))
                     .write_mode(if _is_async {

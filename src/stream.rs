@@ -1,4 +1,4 @@
-use crate::{config, tcp, websocket, ResultType};
+use crate::{bail, tcp, websocket, ResultType};
 #[cfg(feature = "webrtc")]
 use crate::webrtc;
 use sodiumoxide::crypto::secretbox::Key;
@@ -34,6 +34,22 @@ impl Stream {
         }
     }
 
+    /// The largest message the peer may send. Lowered before authorization, where nothing a peer
+    /// legitimately sends is large, so an unauthenticated connection cannot make us hold more than
+    /// that. Each transport clamps `n` to its own ceiling, so `usize::MAX` restores the default.
+    ///
+    /// Set it before the first read of untrusted data. Lowering it later is not a way to constrain
+    /// a message already in progress: what that does to one is up to the transport.
+    #[inline]
+    pub fn set_max_packet_length(&mut self, n: usize) {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => s.set_max_packet_length(n),
+            Stream::WebSocket(s) => s.set_max_packet_length(n),
+            Stream::Tcp(s) => s.codec_mut().set_max_packet_length(n),
+        }
+    }
+
     #[inline]
     pub async fn send_bytes(&mut self, bytes: bytes::Bytes) -> ResultType<()> {
         match self {
@@ -61,6 +77,67 @@ impl Stream {
             Stream::WebRTC(s) => s.set_key(key),
             Stream::WebSocket(s) => s.set_key(key),
             Stream::Tcp(s) => s.set_key(key),
+        }
+    }
+
+    /// The stream key for the key exchange version in `t.picked`: version 0 is `set_key`, and
+    /// version 1 derives one key per direction from the transcript. Any other version is refused
+    /// rather than run as one of these. `is_initiator` is the side that sent the sealed key.
+    #[inline]
+    pub fn set_negotiated_key(
+        &mut self,
+        key: Key,
+        is_initiator: bool,
+        t: &tcp::KxTranscript,
+    ) -> ResultType<()> {
+        match t.picked {
+            0 => {
+                self.set_key(key);
+                Ok(())
+            }
+            1 => match self {
+                #[cfg(feature = "webrtc")]
+                Stream::WebRTC(_) => bail!("key exchange version 1 does not apply to WebRTC"),
+                Stream::WebSocket(s) => s.set_key_split(key, is_initiator, t),
+                Stream::Tcp(s) => s.set_key_split(key, is_initiator, t),
+            },
+            v => bail!("unsupported key exchange version {}", v),
+        }
+    }
+
+    /// An opaque token that changes whenever bytes have arrived from the peer, a fragment of a
+    /// message that is still incomplete included. Compare successive samples; the value itself
+    /// means nothing. `None` where the transport reports no such thing.
+    ///
+    /// A message reaches the caller only once it is whole, so `next()` alone cannot distinguish a
+    /// peer sending a large one — a clipboard image is the case that occurs — from one that died
+    /// mid-message. Sampling this alongside the last received message tells them apart.
+    ///
+    /// TCP and WebSocket answer `None` on purpose: this change leaves their existing close, error
+    /// and 30s-timeout behaviour exactly as it was, and giving them a value would alter it.
+    #[inline]
+    pub fn rx_progress(&self) -> Option<u64> {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => Some(s.rx_progress()),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// Whether ICE has stopped hearing from the peer on a WebRTC transport. Transient and
+    /// recoverable — it says the peer is worth suspecting, never that the session is over — and
+    /// always false for transports this change leaves alone.
+    ///
+    /// Maintained by ICE's own task, so unlike anything derived from the session's read loop it
+    /// stays accurate while that loop is busy sending.
+    #[inline]
+    pub fn webrtc_disconnected(&self) -> bool {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => s.is_disconnected(),
+            #[allow(unreachable_patterns)]
+            _ => false,
         }
     }
 
@@ -153,20 +230,6 @@ impl Stream {
             Stream::WebSocket(s) => s.next_timeout(timeout).await,
             Stream::Tcp(s) => s.next_timeout(timeout).await,
         }
-    }
-
-    /// establish connect from websocket
-    #[inline]
-    pub async fn connect_websocket(
-        url: impl AsRef<str>,
-        local_addr: Option<SocketAddr>,
-        proxy_conf: Option<&config::Socks5Server>,
-        timeout_ms: u64,
-    ) -> ResultType<Self> {
-        let ws_stream =
-            websocket::WsFramedStream::new(url, local_addr, proxy_conf, timeout_ms).await?;
-        log::debug!("WebSocket connection established");
-        Ok(Self::WebSocket(ws_stream))
     }
 
     /// send message

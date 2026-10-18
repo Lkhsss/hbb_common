@@ -34,6 +34,7 @@ use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
+use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
@@ -46,6 +47,7 @@ use url::Url;
 
 use crate::config;
 use crate::protobuf::Message;
+use crate::rx_probe::RxProbe;
 use crate::sodiumoxide::crypto::secretbox::Key;
 use crate::ResultType;
 
@@ -142,7 +144,8 @@ const MAX_RECV_MESSAGE: usize = crate::bytes_codec::MAX_FRAME_LENGTH;
 // unluckily webrtc-rs does not use the same port to do the STUN request
 static DEFAULT_ICE_SERVERS: [&str; 3] = [
     "stun:stun.cloudflare.com:3478",
-    "stun:stun.nextcloud.com:3478",
+    "stun:stun.l.google.com:19302",
+    "stun:stun.antisip.com:3478",
     "stun:stun.nextcloud.com:443",
 ];
 
@@ -339,6 +342,22 @@ impl WebRTCStream {
         }
         let sdp = serde_json::from_str::<RTCSessionDescription>(sdp_json)?;
         Self::get_key_for_sdp(&sdp)
+    }
+
+    fn remove_sessions_for_peer(
+        sessions: &mut HashMap<String, WebRTCStream>,
+        pc: &Arc<RTCPeerConnection>,
+    ) -> Vec<String> {
+        let keys: Vec<String> = sessions
+            .iter()
+            .filter_map(|(key, session)| {
+                Arc::ptr_eq(&session.pc, pc).then(|| key.clone())
+            })
+            .collect();
+        for key in &keys {
+            sessions.remove(key);
+        }
+        keys
     }
 
     #[inline]
@@ -556,6 +575,24 @@ impl WebRTCStream {
         let mut s = SettingEngine::default();
         s.detach_data_channels();
         s.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+        // Answerer only: `remote_endpoint` is empty when this side is the offerer. The
+        // desktop controller keeps the crate default so it stays an unchanged comparison
+        // point while the persistence experiment runs on the controlled side.
+        if !remote_endpoint.is_empty() {
+            s.set_ice_max_binding_requests(Some(Self::ICE_MAX_BINDING_REQUESTS));
+        }
+        // fe80::/10 can only be bound together with a scope id, which `IpAddr` cannot carry, so
+        // gathering one never yields a candidate - only a failed bind and a warning per address.
+        // Spelled out because `is_unicast_link_local` is not stable on our MSRV.
+        s.set_ip_filter(Box::new(|ip: IpAddr| match ip {
+            IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 != 0xfe80,
+            IpAddr::V4(_) => true,
+        }));
+
+        // KCP's nc=1 profile by default, with the same opt-in to a congestion window as
+        // `allow-kcp-congestion-control`, for the reason given at `get_kcp_cc_enabled`. Set per
+        // connection so the option takes effect on the next session, not the next start.
+        webrtc::sctp::association::set_no_congestion_control(!Self::get_cc_enabled());
 
         // Create the API object
         let api = APIBuilder::new().with_setting_engine(s).build();
@@ -685,8 +722,10 @@ impl WebRTCStream {
             let stream_for_close2 = stream_for_close.clone();
             let on_connection_notify = notify_tx.clone();
             let pc_for_close2 = pc_for_close.clone();
+            let disconnected_for_state = disconnected_for_state.clone();
             Box::pin(async move {
                 log::debug!("WebRTC session peer connection state: {}", s);
+                Self::note_health(&disconnected_for_state, s);
                 match s {
                     // `Disconnected` is a transient, recoverable ICE state (webrtc-ice fires it
                     // after ~5s without consent and returns to `Connected` when traffic resumes).
@@ -1028,6 +1067,14 @@ impl WebRTCStream {
         // not-supported
     }
 
+    /// See `Stream::set_max_packet_length`. Clamped to `MAX_RECV_MESSAGE`: the send path checks
+    /// against that constant, so a bound above it would only accept what no peer will ever send.
+    #[inline]
+    pub fn set_max_packet_length(&mut self, n: usize) {
+        self.max_recv_message
+            .store(n.min(MAX_RECV_MESSAGE), Ordering::Relaxed);
+    }
+
     #[inline]
     pub fn local_addr(&self) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
@@ -1036,6 +1083,30 @@ impl WebRTCStream {
     #[inline]
     pub fn set_send_timeout(&mut self, ms: u64) {
         self.send_timeout = ms;
+    }
+
+    /// See `Stream::rx_progress`.
+    #[inline]
+    pub fn rx_progress(&self) -> u64 {
+        self.rx_probe.get()
+    }
+
+    /// Track whether ICE still hears from the peer. `Disconnected` is raised about 5s after it
+    /// stops and is cleared again when traffic resumes, so it is a hint to be acted on by whoever
+    /// asks, never a terminal state; the terminal ones are handled by the caller of this and
+    /// deliberately leave the flag alone, since a closed session has no use for a hint.
+    fn note_health(disconnected: &AtomicBool, s: RTCPeerConnectionState) {
+        match s {
+            RTCPeerConnectionState::Disconnected => disconnected.store(true, Ordering::SeqCst),
+            RTCPeerConnectionState::Connected => disconnected.store(false, Ordering::SeqCst),
+            _ => {}
+        }
+    }
+
+    /// See `Stream::webrtc_disconnected`.
+    #[inline]
+    pub fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::SeqCst)
     }
 
     #[inline]
@@ -1336,6 +1407,10 @@ mod tests {
     use tokio::sync::Barrier;
     use tokio::time::timeout;
     use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+
+    async fn new_test_stream() -> WebRTCStream {
+        WebRTCStream::new("", false, 10000).await.unwrap()
+    }
 
     #[test]
     fn test_webrtc_ice_url() {
