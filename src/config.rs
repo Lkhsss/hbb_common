@@ -114,8 +114,16 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
-pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
+pub const DEFAULT_RENDEZVOUS: &str = match option_env!("DEFAULT_RENDEZVOUS") {
+    Some(val) => val,
+    None => "rs-ny.rustdesk.com",
+};
+
+pub const RENDEZVOUS_SERVERS: &[&str] = &[DEFAULT_RENDEZVOUS];
+pub const RS_PUB_KEY: &str = match option_env!("RS_PUB_KEY") {
+    Some(val) => val,
+    None => "",
+};
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
 pub const RELAY_PORT: i32 = 21117;
